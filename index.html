@@ -158,6 +158,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent-2); }
 .lib-row .t span { font-size: .84rem; color: var(--muted); }
 .lib-row[aria-current="true"] { border-color: var(--accent-2); box-shadow: 0 0 0 1px var(--accent-2) inset; }
 .vo-head .pill { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.vo-src { font-size: .8rem; color: var(--muted); }
+.auto-speed { display: flex; flex-wrap: wrap; gap: 6px; }
+.auto-speed .btn[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+#modal textarea.field { min-height: 110px; background: var(--surface); }
 #modal .box.rec { gap: 16px; }
 .prompter { max-height: 42vh; overflow-y: auto; display: grid; gap: 10px; padding: 14px; border-radius: 12px; background: var(--bg); }
 .prompter p { margin: 0; color: var(--ink); font: 400 1.45rem/1.35 var(--font-display); }
@@ -281,10 +285,13 @@ const DEFAULT_SETTINGS = {
   primary: ["#072843", "#ce8458", "#f6f8f7"],
   secondary: ["#8caecc", "#d7bb89", "#000000"],
   fonts: { h1: { family: "Belleza", bold: false }, h2: { family: "Source Sans 3", bold: true }, body: { family: "Public Sans", bold: false } },
-  quality: 720, transition: "fade", defaultDur: 3,
+  quality: 720, transition: "fade", defaultDur: 3, ttsSpeed: 1.05,
 };
 const XF = 0.5; // crossfade seconds
+const APP_VERSION = "2026.11.02-1817"; // stamped by the build; compared with the copy online to offer updates
 const VO_DELAY = 0.35; // voice starts this long after its scene begins
+const VOICE_ID = "es_MX-claude-high"; // Piper "Claude": female, Mexican Spanish, Apache-2.0
+const SPEEDS = [[1.15, "Pausada"], [1.05, "Normal"], [0.92, "Rápida"]];
 const LIBRARY = [
   { id: "calma", name: "Calma", desc: "Piano suave con fondo cálido", file: "music/calma.wav" },
   { id: "brisa", name: "Brisa", desc: "Arpa ligera, tranquila", file: "music/brisa.wav" },
@@ -538,16 +545,105 @@ async function cleanVoice(ab) {
     return { blob: wavBlob(o, sr, 0.89 / peak), dur: o.length / sr };
   } finally { try { ac.close(); } catch {} }
 }
-async function setSceneVoice(sc, ab, source) {
-  const { blob, dur } = await cleanVoice(ab);
+async function setSceneVoice(sc, ab, source, extra) {
+  const { blob, dur } = ab instanceof Blob ? { blob: ab, dur: extra.dur } : await cleanVoice(ab);
   const id = uid(); await DB.put("blobs", blob, id);
   const old = sc.voice?.blobId;
-  sc.voice = { blobId: id, dur, source };
+  sc.voice = { blobId: id, dur, source, ...(extra?.text ? { text: extra.text, speed: extra.speed } : {}) };
   if (old) await dropBlobIfUnused(old);
   const need = Math.ceil((dur + VO_DELAY + 0.6) * 2) / 2;
   if (sc.duration < need) { sc.duration = need; return "extended"; }
   return true;
 }
+/* ---------- automatic voice: Piper "Claude" running on the phone ---------- */
+const TTS = {
+  CACHE: "bubbles-voz-v1", readyP: null, wasmBuf: null, dataBuf: null, cfg: null, sess: null,
+  async cacheGet(url) { try { const c = await caches.open(this.CACHE); const r = await c.match(url); return r ? await r.arrayBuffer() : null; } catch { return null; } },
+  async cachePut(url, buf) { try { const c = await caches.open(this.CACHE); await c.put(url, new Response(buf.slice(0))); } catch {} },
+  async readBody(r, onBytes) {
+    const total = +r.headers.get("content-length") || 0;
+    if (!r.body?.getReader) return await r.arrayBuffer();
+    const rd = r.body.getReader(); const parts = []; let got = 0;
+    for (;;) { const { done, value } = await rd.read(); if (done) break; parts.push(value); got += value.length; onBytes?.(got, total); }
+    const u = new Uint8Array(got); let o = 0; for (const p of parts) { u.set(p, o); o += p.length; } return u.buffer;
+  },
+  async fetchCached(url, onBytes, alts = []) {
+    const hit = await this.cacheGet(url); if (hit) { onBytes?.(hit.byteLength, hit.byteLength); return hit; }
+    let buf = null;
+    try { const r = await fetch(url); if (r.ok) buf = await this.readBody(r, onBytes); } catch {}
+    if (!buf) { // big files are hosted as numbered pieces listed in <file>.parts.json (GitHub's web upload takes 25 MB max)
+      try {
+        const m = await fetch(url + ".parts.json");
+        if (m.ok) {
+          const man = await m.json(); const u = new Uint8Array(man.size); let o = 0;
+          for (const part of man.parts) { const x = await fetch(part); if (!x.ok) throw new Error(part); const b = new Uint8Array(await x.arrayBuffer()); u.set(b, o); o += b.length; onBytes?.(o, man.size); }
+          buf = u.buffer;
+        }
+      } catch {}
+    }
+    for (const a of alts) { if (buf) break; try { const r = await fetch(a); if (r.ok) buf = await this.readBody(r, onBytes); } catch {} }
+    if (!buf) throw new Error("No se pudo descargar " + url);
+    await this.cachePut(url, buf); return buf;
+  },
+  files() {
+    const hf = "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_MX/claude/high/" + VOICE_ID;
+    return [["tts/ort-wasm-simd.wasm", 10.6, []], ["tts/piper_phonemize.wasm", 0.6, []], ["tts/piper_phonemize.data", 18.1, []],
+      [`voices/${VOICE_ID}.onnx`, 63, [hf + ".onnx"]], [`voices/${VOICE_ID}.onnx.json`, 0.01, [hf + ".onnx.json"]]];
+  },
+  async isDownloaded() { try { const c = await caches.open(this.CACHE); for (const [f] of this.files()) if (!(await c.match(f))) return false; return true; } catch { return false; } },
+  loadOne(src) { return new Promise((res, rej) => { const el = document.createElement("script"); el.src = src; el.onload = res; el.onerror = () => { el.remove(); rej(new Error("No se pudo cargar " + src)); }; document.head.appendChild(el); }); },
+  async loadScript(...srcs) { let err; for (const x of srcs) { try { await this.loadOne(x); return; } catch (e) { err = e; } } throw err; },
+  prepare(onProgress) {
+    if (this.sess) return Promise.resolve();
+    if (this.readyP) return this.readyP;
+    this.readyP = (async () => {
+      const files = this.files(); const sizes = files.map((f) => f[1] * 1e6); const got = files.map(() => 0);
+      const tick = (i) => (n, t) => { got[i] = n; if (t) sizes[i] = t; onProgress?.(got.reduce((a, b) => a + b, 0) / sizes.reduce((a, b) => a + b, 0)); };
+      if (!window.ort) await this.loadScript("tts/ort.min.js", "https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/ort.min.js");
+      if (!window.createPiperPhonemize) await this.loadScript("tts/piper_phonemize.js", "https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize.js");
+      const [ortWasm, phWasm, phData, model, cfg] = await Promise.all(files.map(([f, , alts], i) => this.fetchCached(f, tick(i), alts)));
+      const wasmUrl = URL.createObjectURL(new Blob([ortWasm], { type: "application/wasm" }));
+      ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
+      ort.env.wasm.wasmPaths = { "ort-wasm-simd.wasm": wasmUrl, "ort-wasm.wasm": wasmUrl };
+      this.wasmBuf = phWasm; this.dataBuf = phData; this.cfg = JSON.parse(new TextDecoder().decode(cfg));
+      this.sess = await ort.InferenceSession.create(model, { executionProviders: ["wasm"] });
+    })();
+    return this.readyP.catch((e) => { this.readyP = null; throw e; });
+  },
+  async phonemes(text) {
+    const lines = [];
+    const mod = await createPiperPhonemize({
+      print: (l) => lines.push(l), printErr: () => {}, noInitialRun: true,
+      wasmBinary: this.wasmBuf.slice(0), getPreloadedPackage: () => this.dataBuf.slice(0), locateFile: (u) => "tts/" + u,
+    });
+    mod.callMain(["-l", this.cfg.espeak.voice, "--input", JSON.stringify([{ text }]), "--espeak_data", "/espeak-ng-data"]);
+    const ids = []; for (const l of lines) { try { const j = JSON.parse(l); if (j.phoneme_ids?.length) ids.push(j.phoneme_ids); } catch {} }
+    return ids;
+  },
+  async synth(text, speed, onProgress) {
+    await this.prepare(onProgress);
+    const cfg = this.cfg; const sr = cfg.audio.sample_rate;
+    const sentences = String(text).replace(/\s+/g, " ").split(/(?<=[.!?…:;])\s+/).map((x) => x.trim()).filter(Boolean);
+    const chunks = []; const gap = new Float32Array(Math.round(sr * 0.32));
+    for (const sentence of sentences) {
+      for (const ids of await this.phonemes(sentence)) {
+        const out = await this.sess.run({
+          input: new ort.Tensor("int64", BigInt64Array.from(ids.map(BigInt)), [1, ids.length]),
+          input_lengths: new ort.Tensor("int64", BigInt64Array.from([BigInt(ids.length)]), [1]),
+          scales: new ort.Tensor("float32", Float32Array.from([cfg.inference.noise_scale, cfg.inference.length_scale * speed, cfg.inference.noise_w]), [3]),
+        });
+        chunks.push(out.output.data, gap);
+      }
+    }
+    if (!chunks.length) throw new Error("Sin texto");
+    chunks.pop();
+    const n = chunks.reduce((a, c) => a + c.length, 0); const pcm = new Float32Array(n); let o = 0;
+    for (const c of chunks) { pcm.set(c, o); o += c.length; }
+    let peak = 0; for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(pcm[i]));
+    return { blob: wavBlob(pcm, sr, peak > 0 ? 0.89 / peak : 1), dur: n / sr };
+  },
+  async clear() { try { await caches.delete(this.CACHE); } catch {} this.sess = null; this.readyP = null; },
+};
 function wavBlob(pcm, sr, gain = 1) {
   const n = pcm.length; const buf = new ArrayBuffer(44 + n * 2); const v = new DataView(buf);
   const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
@@ -894,6 +990,22 @@ const thumbStyle = (u) => (u ? `style="background-image:url('${u}')"` : "");
 function projMeta(p) { const t = timeline(p).total; return `${p.scenes.length} ${p.scenes.length === 1 ? "escena" : "escenas"} · ${fmtDur(t)} · ${fmtDate(p.updated)}`; }
 
 function isStandalone() { try { return navigator.standalone === true || matchMedia("(display-mode: standalone)").matches; } catch { return false; } }
+/* ---------- updates: compare with the copy online ---------- */
+const isFramed = () => { try { return window.top !== window; } catch { return true; } };
+async function checkUpdate() { // newer version string, false when up to date, null when offline
+  try {
+    const r = await fetch("./index.html?check=" + Date.now(), { cache: "no-store" }); if (!r.ok) return null;
+    const m = (await r.text()).match(/const APP_VERSION = "([^"]+)"/);
+    return m && m[1] !== APP_VERSION && m[1] !== "__BUILD__" ? m[1] : false;
+  } catch { return null; }
+}
+async function applyUpdate() {
+  toast("Actualizando…"); await flushSave();
+  try { const reg = await navigator.serviceWorker?.getRegistration(); await reg?.update(); } catch {}
+  try { for (const k of await caches.keys()) if (k.startsWith("bubbles-studio-")) await caches.delete(k); } catch {}
+  location.reload();
+}
+const versionLabel = () => (APP_VERSION === "__BUILD__" ? "desarrollo" : APP_VERSION);
 function showInstallHint() {
   let framed = true; try { framed = window.top !== window; } catch {}
   const secure = location.protocol === "https:" || location.hostname === "localhost";
@@ -928,6 +1040,7 @@ function renderHome() {
   const last = [...drafts].sort((a, b) => b.updated - a.updated)[0];
   app.innerHTML = `<main class="wrap">
     <header class="home-head"><div class="mark">${ICON.bubbles}</div><h1>Bubbles Studio</h1><p>Videos para tus redes, escena por escena.</p></header>
+    ${S.update ? `<div class="warn install" style="margin-bottom:16px"><strong>Hay una versión nueva de Bubbles Studio</strong><span>Tus proyectos y videos se quedan como están.</span><button class="btn primary" data-action="do-update" style="justify-self:start;margin-top:6px">${ICON.save}Actualizar ahora</button></div>` : ""}
     <nav class="tiles" aria-label="Menú principal">
       <button class="tile new" data-action="new">${ICON.plus}<span class="t">Nuevo proyecto</span><span class="s">Fotos, videos, texto y música</span></button>
       <button class="tile" data-action="go" data-view="drafts">${ICON.drafts}<span class="t">Borradores</span><span class="s">${drafts.length} en progreso</span></button>
@@ -974,12 +1087,30 @@ function renderSettings() {
     <section class="card set"><h2>Colores principales</h2><p class="sub">Hasta 3. Toca un círculo para cambiarlo.</p>${pal("primary", 3)}</section>
     <section class="card set"><h2>Colores secundarios</h2><p class="sub">Hasta 5.</p>${pal("secondary", 5)}</section>
     <section class="card set"><h2>Fuentes</h2>${fontRow("h1")}${fontRow("h2")}${fontRow("body")}</section>
+    <section class="card set"><h2>Voz automática</h2><p class="sub">Voz femenina en español de México, creada en el teléfono. La primera vez se descargan unos 92 MB (usa Wi-Fi); después funciona sin internet.</p>
+      <div class="ctl"><span>Velocidad inicial</span><div class="seg">${SPEEDS.map(([v, l]) => `<button data-action="set-speed" data-v="${v}" aria-pressed="${st.ttsSpeed === v}">${l}</button>`).join("")}</div></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm" data-action="try-voice">${ICON.play}Probar la voz</button><button class="btn sm ghost danger" data-action="clear-voices">${ICON.trash}Borrar voz descargada</button></div>
+      <p class="note" id="voice-note"></p>
+      <p class="note">Voz “Claude” de Piper (licencia Apache 2.0), libre para uso comercial.</p>
+    </section>
+    ${isFramed() ? "" : `<section class="card set"><h2>Aplicación</h2>
+      <p class="sub">Versión instalada: <b>${esc(versionLabel())}</b></p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap" id="upd-row">${S.update
+        ? `<button class="btn sm primary" data-action="do-update">${ICON.save}Actualizar a ${esc(S.update)}</button>`
+        : `<button class="btn sm" data-action="check-update">${ICON.save}Buscar actualización</button>`}</div>
+      <p class="note" id="upd-note">${S.update ? "Hay una versión nueva. Tus proyectos, videos y la voz descargada se quedan." : ""}</p>
+    </section>`}
     <section class="card set"><h2>Video</h2>
       <div class="ctl"><span>Calidad</span><div class="seg">${[[720, "720p · más rápido"], [1080, "1080p · más nítido"]].map(([v, l]) => `<button data-action="set" data-k="quality" data-v="${v}" aria-pressed="${st.quality == v}">${l}</button>`).join("")}</div></div>
       <div class="ctl"><span>Cambio entre escenas</span><div class="seg">${[["fade", "Fundido suave"], ["cut", "Corte directo"]].map(([v, l]) => `<button data-action="set" data-k="transition" data-v="${v}" aria-pressed="${st.transition === v}">${l}</button>`).join("")}</div></div>
       <div class="ctl"><span>Duración inicial de cada escena</span><div class="dur" style="grid-template-columns:1fr auto"><input type="range" min="1" max="10" step="0.5" value="${st.defaultDur}" data-setting="defaultDur" aria-label="Duración inicial"><output>${fmtDur(st.defaultDur)}</output></div></div>
       <p class="note">Tus proyectos se guardan solo en este teléfono. Si eliminas la app o borras los datos del navegador, se borran también. Guarda tus videos terminados en la galería del teléfono.</p>
     </section></main>`;
+  updateVoiceNote();
+}
+async function updateVoiceNote() {
+  const el = $("#voice-note"); if (!el) return;
+  const ok = await TTS.isDownloaded(); if ($("#voice-note")) el.textContent = ok ? "La voz ya está descargada en este teléfono." : "La voz aún no está descargada.";
 }
 
 /* editor */
@@ -1012,8 +1143,10 @@ function sceneCard(sc, i, n) {
     <div class="vo">
       <div class="vo-head">${ICON.mic}<span>Voz en off</span><span class="pill">opcional</span></div>
       <div class="vo-row">${sc.voice?.blobId
-        ? `<button class="btn sm" data-action="vo-play">${ICON.play}Escuchar · ${fmtDur(sc.voice.dur)}</button><button class="btn sm" data-action="vo-rec">${ICON.mic}Grabar otra vez</button><button class="btn sm ghost danger" data-action="vo-rm">Quitar</button>`
-        : `<button class="btn sm primary" data-action="vo-rec">${ICON.mic}Grabar</button><button class="btn sm" data-action="vo-upload">${ICON.music}Subir audio</button>`}</div>
+        ? `<button class="btn sm" data-action="vo-play">${ICON.play}Escuchar · ${fmtDur(sc.voice.dur)}</button>${sc.voice.source === "auto"
+            ? `<button class="btn sm" data-action="vo-auto">${ICON.drafts}Editar texto</button>` : `<button class="btn sm" data-action="vo-rec">${ICON.mic}Grabar otra vez</button>`}<button class="btn sm ghost danger" data-action="vo-rm">Quitar</button>`
+        : `<button class="btn sm primary" data-action="vo-rec">${ICON.mic}Grabar</button><button class="btn sm" data-action="vo-upload">${ICON.music}Subir audio</button><button class="btn sm" data-action="vo-auto">${ICON.bubbles.replace('viewBox="0 0 60 60"', 'viewBox="0 0 60 60" width="18" height="18"')}Voz automática</button>`}</div>
+      ${sc.voice?.blobId ? `<div class="vo-src">${{ mic: "Tu voz grabada", file: "Audio subido", auto: "Voz automática" }[sc.voice.source] || "Voz"}</div>` : ""}
     </div>
     <div class="dur"><label for="d-${sc.id}">En pantalla</label><input id="d-${sc.id}" type="range" min="1" max="15" step="0.5" value="${sc.duration}" data-field="duration"><output>${fmtDur(sc.duration)}</output></div>
     ${m?.kind === "video" && m.dur > 1 ? `<div class="dur"><label for="s-${sc.id}">Empieza en</label><input id="s-${sc.id}" type="range" min="0" max="${Math.max(0, m.dur - 0.5).toFixed(1)}" step="0.1" value="${m.start}" data-field="start"><output>${fmtDur(m.start)}</output></div>` : ""}
@@ -1026,7 +1159,7 @@ function renderScenes() {
       ${p.music ? `<button class="btn sm ghost danger" data-action="rm-music">Quitar</button>` : ""}<button class="btn sm" data-action="pick-music">${p.music ? "Cambiar" : "Elegir"}</button></div>
       ${p.music ? `<div class="dur" style="grid-template-columns:auto 1fr auto"><label for="vol">Volumen</label><input id="vol" type="range" min="0" max="1" step="0.05" value="${p.music.volume}" data-action-input="music-vol"><output>${Math.round(p.music.volume * 100)}%</output></div>` : ""}
     </section>
-    <p class="note" style="margin:-4px 2px 14px">${ICON.mic.replace("<svg", '<svg width="15" height="15" style="vertical-align:-3px;color:var(--accent-2)"')} Puedes grabar tu voz en cada escena. La música baja sola mientras hablas.</p>
+    <p class="note" style="margin:-4px 2px 14px">${ICON.mic.replace("<svg", '<svg width="15" height="15" style="vertical-align:-3px;color:var(--accent-2)"')} En cada escena puedes grabar tu voz, subir un audio o usar la voz automática. La música baja sola mientras habla la voz.</p>
     <div class="scenes">${p.scenes.map((s, i) => sceneCard(s, i, p.scenes.length)).join("")}</div>
     <div class="add-row"><button class="btn" data-action="add-scene">${ICON.plus}Añadir escena</button><button class="btn" data-action="add-many">${ICON.stack}Varias fotos o videos</button></div>
     <p class="note" style="text-align:center;margin-top:14px">Total: <b id="total">${fmtDur(tl.total)}</b></p>`;
@@ -1208,6 +1341,44 @@ async function recordVoice(sc, i) {
   if (cancelled) return;
   await storeVoice(sc, new Blob(chunks, { type: rec.mimeType || "audio/mp4" }), "mic");
 }
+function openAutoVoice(sc, i) {
+  const m = $("#modal");
+  const fromScene = [sc.title, sc.subtitle, sc.body].map((x) => (x || "").trim()).filter(Boolean)
+    .map((x, k, arr) => (k < arr.length - 1 && !/[.!?…:;,]$/.test(x) ? x + "." : x)).join(" ");
+  let speed = sc.voice?.source === "auto" ? sc.voice.speed || S.settings.ttsSpeed : S.settings.ttsSpeed;
+  m.innerHTML = `<div class="box" role="dialog" aria-modal="true" aria-labelledby="mt"><h3 id="mt">Voz automática · Escena ${i + 1}</h3>
+    <p>Voz femenina en español de México. Escribe lo que dirá.</p>
+    <textarea class="field" id="tts-text" aria-label="Texto de la voz">${esc(sc.voice?.source === "auto" ? sc.voice.text || "" : fromScene)}</textarea>
+    <div class="auto-speed" role="group" aria-label="Velocidad">${SPEEDS.map(([v, l]) => `<button class="btn sm" data-sp="${v}" aria-pressed="${v === speed}">${l}</button>`).join("")}</div>
+    <p class="note" id="tts-note"></p>
+    <div class="row"><button class="btn" id="tts-cancel">Cancelar</button><button class="btn primary" id="tts-go">Crear voz</button></div></div>`;
+  m.hidden = false;
+  const note = $("#tts-note"); let busy = false;
+  TTS.isDownloaded().then((ok) => { if (!ok && note && !busy) note.textContent = "La primera vez se descargan unos 92 MB (usa Wi-Fi). Después funciona sin internet."; });
+  const paint = () => m.querySelectorAll("[data-sp]").forEach((b) => b.setAttribute("aria-pressed", String(+b.dataset.sp === speed)));
+  const close = () => { if (busy) return; m.hidden = true; m.innerHTML = ""; m.onclick = null; };
+  m.onclick = async (e) => {
+    if (e.target === m) return close();
+    const sp = e.target.closest("[data-sp]"); if (sp) { speed = +sp.dataset.sp; paint(); return; }
+    if (e.target.closest("#tts-cancel")) return close();
+    if (e.target.closest("#tts-go")) {
+      const text = $("#tts-text").value.trim();
+      if (!text) { toast("Escribe lo que dirá la voz."); return; }
+      busy = true; const go = $("#tts-go"); go.disabled = true; $("#tts-cancel").disabled = true;
+      try {
+        const r = await TTS.synth(text, speed, (f) => { note.textContent = f < 1 ? `Descargando la voz… ${Math.round(f * 100)}%` : "Creando la voz…"; });
+        note.textContent = "Guardando…";
+        const res = await setSceneVoice(sc, r.blob, "auto", { dur: r.dur, text, speed }); touch();
+        busy = false; close();
+        if (S.view === "editor" && S.step === "scenes") renderScenes();
+        toast(res === "extended" ? "Voz lista. Alargué la escena para que quepa." : "Voz lista");
+      } catch (err) {
+        console.error(err); busy = false; go.disabled = false; $("#tts-cancel").disabled = false;
+        note.textContent = "No se pudo crear la voz. Revisa la conexión a internet (solo la primera vez) e inténtalo de nuevo.";
+      }
+    }
+  };
+}
 async function storeVoice(sc, blob, source) {
   toast("Preparando la voz…");
   try {
@@ -1284,6 +1455,14 @@ document.addEventListener("click", async (e) => {
       if (bl) saveVideoFile(bl, pr.name, a === "share-video" ? "share" : "save"); else toast("No se encontró el video."); break;
     }
     case "save-last": case "share-last": if (S.lastResult) saveVideoFile(S.lastResult.blob, p?.name, a === "share-last" ? "share" : "save"); break;
+    case "check-update": {
+      const note = $("#upd-note"); b.disabled = true; if (note) note.textContent = "Buscando…";
+      const v = await checkUpdate(); b.disabled = false;
+      if (v) { S.update = v; renderSettings(); }
+      else if (note) note.textContent = v === false ? "Ya tienes la versión más reciente." : "Sin conexión. Inténtalo cuando tengas internet.";
+      break;
+    }
+    case "do-update": applyUpdate(); break;
     case "install": if (installEvt) { const ev = installEvt; installEvt = null; ev.prompt(); try { await ev.userChoice; } catch {} render(); } break;
     case "close-editor": closeEditor(); break;
     case "step": stopPreview(); S.step = b.dataset.step; if (S.player) { S.player.destroy(); S.player = null; } renderEditor(); window.scrollTo(0, 0); break;
@@ -1309,6 +1488,22 @@ document.addEventListener("click", async (e) => {
     }
     case "pick-music": openLibrary(); break;
     case "vo-rec": { const i = sceneIndex(b); recordVoice(p.scenes[i], i); break; }
+    case "vo-auto": { const i = sceneIndex(b); stopPreview(); openAutoVoice(p.scenes[i], i); break; }
+    case "set-speed": S.settings.ttsSpeed = +b.dataset.v; await saveSettings(); renderSettings(); break;
+    case "try-voice": {
+      const note = $("#voice-note"); b.disabled = true;
+      try {
+        const r = await TTS.synth("Hola. Bienvenida a Bubbles Spa, un lugar para consentirte y relajarte.", S.settings.ttsSpeed,
+          (f) => { if (note) note.textContent = f < 1 ? `Descargando la voz… ${Math.round(f * 100)}%` : "Creando la voz…"; });
+        playPreview(URL.createObjectURL(r.blob));
+      } catch (e) { console.error(e); toast("No se pudo descargar la voz. Revisa la conexión."); }
+      finally { b.disabled = false; updateVoiceNote(); }
+      break;
+    }
+    case "clear-voices": {
+      if (!(await ask("¿Borrar la voz descargada?", "Liberas unos 92 MB. Las voces que ya creaste en tus proyectos se quedan; solo se volverá a descargar si creas una voz nueva.", "Borrar"))) break;
+      await TTS.clear(); updateVoiceNote(); toast("Voz borrada del teléfono"); break;
+    }
     case "vo-upload": {
       const sc = p.scenes[sceneIndex(b)]; const files = await pickFiles("audio/*", false); if (!files[0]) break;
       await storeVoice(sc, files[0], "file"); break;
@@ -1391,6 +1586,7 @@ document.addEventListener("change", async (e) => {
   const seeded = await DB.get("kv", "seeded");
   if (!seeded && !S.projects.length) { const ex = exampleProject(); S.projects.push(ex); await DB.put("projects", ex); await DB.put("kv", true, "seeded"); applyBrand(); ensureFonts().then(async () => { ex.thumb = await projectThumb(ex); await DB.put("projects", ex); if (S.view === "home") render(); }); }
   applyBrand(); render();
+  if (!isFramed() && navigator.onLine !== false) checkUpdate().then((v) => { if (v) { S.update = v; if (S.view === "home" || S.view === "settings") render(); } });
   try { if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost") && window.top === window) navigator.serviceWorker.register("sw.js").catch(() => {}); } catch {}
 })();
 </script>
